@@ -1,0 +1,10 @@
+[Unit]
+Description=Coarse fail-safe: pull Signal messages hourly (event-driven path unit is the real-time primary)
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,8 @@
+[Unit]
+Description=Zhizi Signal agent - pull queued messages (cascades to Drive backup on new bytes)
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=%h/bin/signal-agent receive

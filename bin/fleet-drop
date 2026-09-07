@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# fleet-drop — push files from any fleet-reachable host to the owner's phone.
+# Route: <this host> --scp--> a relay host with clean egress where signal-cli is linked
+#        --signal-agent send-attach --note-to-self--> Signal "Note to Self" on the owner's phone.
+# Chosen over any web surface because these drops are private (E2E, no public face).
+#
+# Usage: fleet-drop [--note "message"] [--check] <file>...
+#   --check   only verify the route (ssh + signal-agent whoami), send nothing
+#   --note    caption sent with the FIRST file (others get the filename)
+# Exit 0 only if the Signal server ACCEPTED every file. Per-file receipt appended to
+# ~/.signal-agent/fleet-drop.jsonl. 95MB per-file cap (Signal attachment limit).
+set -uo pipefail
+HOST="${FLEET_DROP_HOST:?set FLEET_DROP_HOST=user@relay-host (the box where signal-agent is linked)}"
+HOST_FALLBACK="${FLEET_DROP_HOST_FALLBACK:-$HOST}"
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=12 -o ServerAliveInterval=10)
+LEDGER="${SIGNAL_HOME:-$HOME/.signal-agent}/fleet-drop.jsonl"
+REMOTE_INBOX="fleet-drop/inbox"
+MAX_BYTES=$((95*1024*1024))
+NOTE=""; CHECK=0; FILES=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --note) NOTE="$2"; shift 2;;
+    --check) CHECK=1; shift;;
+    -h|--help) sed -n 2,14p "$0"; exit 0;;
+    *) FILES+=("$1"); shift;;
+  esac
+done
+pick_host() {  # first host that answers a trivial ssh (Tailscale first, public IP fallback)
+  for h in "$HOST" "$HOST_FALLBACK"; do
+    if ssh "${SSH_OPTS[@]}" "$h" true 2>/dev/null; then echo "$h"; return 0; fi
+  done
+  return 1
+}
+H="$(pick_host)" || { echo "fleet-drop: route down (neither $HOST nor $HOST_FALLBACK answers ssh)" >&2; exit 3; }
+if [ "$CHECK" = 1 ]; then
+  ssh "${SSH_OPTS[@]}" "$H" '~/bin/signal-agent whoami 2>&1 | head -5' || { echo "fleet-drop: signal-agent whoami failed on $H" >&2; exit 3; }
+  echo "fleet-drop: route OK via $H"; exit 0
+fi
+[ ${#FILES[@]} -gt 0 ] || { echo "fleet-drop: no files" >&2; exit 2; }
+mkdir -p "$(dirname "$LEDGER")"
+ssh "${SSH_OPTS[@]}" "$H" "mkdir -p ~/$REMOTE_INBOX" || exit 3
+fail=0; first=1
+for f in "${FILES[@]}"; do
+  if [ ! -f "$f" ]; then echo "fleet-drop: missing $f" >&2; fail=1; continue; fi
+  sz=$(stat -f %z "$f" 2>/dev/null || stat -c %s "$f")
+  if [ "$sz" -gt "$MAX_BYTES" ]; then echo "fleet-drop: $f is ${sz}B > 95MB cap" >&2; fail=1; continue; fi
+  base="$(basename "$f")"; stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  rname="${stamp}-${base}"
+  if ! scp "${SSH_OPTS[@]}" -q "$f" "$H:$REMOTE_INBOX/$rname"; then
+    echo "fleet-drop: scp failed for $f" >&2; fail=1
+    printf '{"ts":"%s","file":"%s","bytes":%s,"host":"%s","stage":"scp","status":"failed"}\n' "$stamp" "$f" "$sz" "$H" >> "$LEDGER"; continue
+  fi
+  if [ "$first" = 1 ] && [ -n "$NOTE" ]; then msg="$NOTE"; else msg="$base"; fi
+  first=0
+  out="$(ssh "${SSH_OPTS[@]}" "$H" "~/bin/signal-agent send-attach --note-to-self ~/$REMOTE_INBOX/$(printf %q "$rname") $(printf %q "$msg") 2>&1")"; rc=$?
+  ts_sent="$(printf '%s\n' "$out" | grep -oE '[0-9]{13}' | tail -1)"
+  if [ "$rc" -eq 0 ]; then
+    echo "fleet-drop: ACCEPTED $base (signal ts ${ts_sent:-?})"
+    printf '{"ts":"%s","file":"%s","bytes":%s,"host":"%s","stage":"signal","status":"accepted","signal_ts":"%s"}\n' "$stamp" "$f" "$sz" "$H" "${ts_sent:-}" >> "$LEDGER"
+  else
+    echo "fleet-drop: REJECTED $base rc=$rc: $(printf '%s' "$out" | tail -2 | tr '\n' ' ')" >&2; fail=1
+    printf '{"ts":"%s","file":"%s","bytes":%s,"host":"%s","stage":"signal","status":"rejected","rc":%s}\n' "$stamp" "$f" "$sz" "$H" "$rc" >> "$LEDGER"
+  fi
+done
+exit $fail

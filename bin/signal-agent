@@ -1,0 +1,332 @@
+#!/usr/bin/env bash
+# signal-agent — thin wrapper over signal-cli for a personal-agent Signal channel.
+# Intended to run on a box with clean egress to chat.signal.org, so signal-cli is
+# called directly (no proxy wrapping). If your network blocks Signal, see INSTALL.md
+# step 5 (SOCKS via proxychains) or run this on a small VPS with clean egress.
+#
+# Architecture: signal-cli runs as a LINKED secondary
+# device on the owner's already-registered Signal account (like Signal Desktop),
+# NOT a separate bot number. Purpose = give the agent read/write access to
+# the owner's conversations with close collaborators, as a clean post-WeChat
+# surface. On-demand / event-triggered, NOT a 24/7 poller (energy-down doctrine).
+#
+# Subcommands:
+#   signal-agent link [name]      — OWNER-GATE: link this box to the owner's Signal
+#                                   account (prints QR/URI to scan; blocks)
+#   signal-agent whoami           — show linked account / device state
+#   signal-agent receive          — pull queued messages, append to ledger, print JSON,
+#                                   and (if new bytes were appended) push ledger to Drive
+#   signal-agent recent [N]       — show last N received messages (default 20) from ledger
+#   signal-agent send <recipient> <message...>   — send to a number (+E164),
+#                                   a UUID, or --note-to-self. VERIFIED: exits 0
+#                                   only if the Signal server accepted it for
+#                                   every recipient (results[].type==SUCCESS);
+#                                   prints the send timestamp on stdout, logs
+#                                   the raw result to sent.jsonl, and prints the
+#                                   parsed reason + non-zero rc on rejection.
+#   signal-agent send-group <groupId> <message...>
+#   signal-agent groups           — list groups
+#   signal-agent contacts         — list known contacts
+#   signal-agent backup           — rclone copy the signal-channel dir to Google Drive
+#
+# recipient = E.164 phone number (+8613..., +1...) or saved contact.
+set -euo pipefail
+
+# signal-cli 0.14.5 is compiled for Java 25 (class file 69). The box's system
+# java is 21, so pin signal-cli to the dedicated Temurin JDK 25 in /opt/jdk25.
+# This does NOT change the system java used by the rest of the fleet.
+export JAVA_HOME="${JAVA_HOME_SIGNAL_CLI:-${JAVA_HOME:-/opt/jdk25}}"
+
+# ENCODING FIX (2026-07-11): non-interactive ssh sessions inherit macOS-forwarded
+# LC_CTYPE=UTF-8, which is INVALID on Linux -> locale falls back to POSIX ->
+# JVM sun.jnu.encoding=ANSI_X3.4-1968 (ASCII) -> signal-cli decodes argv (-m)
+# as ASCII and every non-ASCII byte becomes U+FFFD. Chinese text was corrupted
+# AT SEND TIME. Force a valid UTF-8 locale here so argv decodes correctly no
+# matter how this wrapper is invoked (ssh, cron, systemd, interactive).
+export LC_ALL=C.UTF-8 LANG=C.UTF-8
+unset LC_CTYPE LANGUAGE
+# Belt-and-suspenders for any future JDK/env drift:
+export JAVA_TOOL_OPTIONS="-Dfile.encoding=UTF-8 -Dsun.jnu.encoding=UTF-8 ${SIGNAL_JNI_PATH:+-Djava.library.path=$SIGNAL_JNI_PATH }${JAVA_TOOL_OPTIONS:-}"
+
+SIGNAL_BIN="${SIGNAL_CLI_BIN:-$(command -v signal-cli || echo /opt/signal-cli/bin/signal-cli)}"
+
+STORE="${SIGNAL_HOME:-$HOME/.signal-agent}"
+LEDGER="$STORE/messages.jsonl"
+# Box-originated send log (2026-08-07). Every `send` appends signal-cli's raw
+# structured result here. Its absence is why the 08-07 delivery diagnosis had to
+# reconstruct this box's own sends by set-difference against other devices'
+# syncMessages — a linked secondary does not sync its own sends back to itself.
+SENTLOG="$STORE/sent.jsonl"
+mkdir -p "$STORE"
+
+# Google Drive backup target (rclone). Remote name + folder are owner-gated
+# (rclone OAuth). backup() no-ops gracefully until the remote exists.
+RCLONE_REMOTE="${SIGNAL_RCLONE_REMOTE:-gdrive}"
+RCLONE_PATH="${SIGNAL_RCLONE_PATH:-signal-agent-backup}"
+
+die() { echo "signal-agent: $*" >&2; exit 1; }
+[ -x "$SIGNAL_BIN" ] || die "signal-cli not found ($SIGNAL_BIN)"
+
+# Clean network on this box — call signal-cli directly, no proxychains.
+SIGNAL_CLI() {
+  "$SIGNAL_BIN" "$@"
+}
+
+# ---------------------------------------------------------------------------
+# do_send — structured, VERIFIED send (2026-08-07 hardening)
+#
+# BUG THIS FIXES: the old `send` branch ran `SIGNAL_CLI send -m "$msg" "$rcpt"`
+# with no `-o json`. signal-cli's per-recipient results[].type
+# (SUCCESS / UNREGISTERED_FAILURE / IDENTITY_FAILURE / NETWORK_FAILURE) was
+# discarded, so rc=0 meant only "the process exited cleanly", NOT "the Signal
+# server accepted this message for this recipient". Callers then reported
+# "sent" with no proof of acceptance.
+#
+# NOW: exit status reflects ACTUAL server acceptance.
+#   0 — every recipient came back SUCCESS, and we have a real send timestamp
+#   1 — Signal rejected at least one recipient, or acceptance is unprovable
+#   2 — signal-cli emitted no parseable JSON result at all (crash/bad recipient)
+#
+# STDOUT CONTRACT (compatible with the old plain-mode output): on success,
+# exactly one line containing the bare send timestamp, e.g. 1786109211479.
+# Callers record it to correlate later delivery/read receipts in messages.jsonl.
+# Every diagnostic — success banner included — goes to stderr, so stdout stays
+# a clean machine-readable timestamp.
+#
+# usage: do_send <signal-cli send args...>      (e.g. do_send -m "$msg" "$rcpt")
+do_send() {
+  local out err rc errfile
+  errfile="$(mktemp)"
+  set +e
+  out="$(SIGNAL_CLI -o json send "$@" 2>"$errfile")"
+  rc=$?
+  set -e
+  err="$(cat "$errfile")"; rm -f "$errfile"
+
+  # Persist the raw result (success or failure) before interpreting it.
+  if [ -n "$out" ]; then
+    printf '%s\n' "$out" >> "$SENTLOG"
+  fi
+
+  SEND_RAW="$out" SEND_ERR="$err" SEND_RC="$rc" python3 - <<'PY'
+import json, os, sys
+
+raw    = os.environ.get("SEND_RAW", "")
+err    = os.environ.get("SEND_ERR", "")
+cli_rc = os.environ.get("SEND_RC", "?")
+
+def w(s):
+    sys.stderr.write(s + "\n")
+
+# signal-cli prints one JSON object per send; take the last parseable one.
+obj = None
+for line in raw.splitlines():
+    line = line.strip()
+    if not line.startswith("{"):
+        continue
+    try:
+        cand = json.loads(line)
+    except Exception:
+        continue
+    if isinstance(cand, dict) and ("results" in cand or "timestamp" in cand):
+        obj = cand
+
+if obj is None:
+    w("signal-agent: SEND FAILED — signal-cli returned no parseable JSON "
+      "result (signal-cli rc=%s). NOT sent." % cli_rc)
+    # Strip Java stack frames; the useful text is the exception message and
+    # the human-readable last lines.
+    msgs = [l.rstrip() for l in err.splitlines()
+            if l.strip()
+            and not l.lstrip().startswith("at ")
+            and not l.startswith("Picked up JAVA_TOOL_OPTIONS")]
+    for l in msgs[-4:]:
+        w("signal-agent:   %s" % l.strip())
+    sys.exit(2)
+
+ts      = obj.get("timestamp")
+results = obj.get("results") or []
+
+def who(r):
+    a = r.get("recipientAddress") or {}
+    return a.get("number") or a.get("uuid") or a.get("username") or "?"
+
+def kind(r):
+    return str(r.get("type", "") or "").upper()
+
+bad = [r for r in results if kind(r) != "SUCCESS"]
+ok  = [r for r in results if kind(r) == "SUCCESS"]
+
+if bad:
+    w("signal-agent: SEND REJECTED by Signal — NOT delivered (rc from "
+      "signal-cli was %s, which is why this had to be parsed)." % cli_rc)
+    for r in bad:
+        w("signal-agent:   %s -> %s" % (who(r), r.get("type")))
+    if ok:
+        w("signal-agent:   (partial) accepted for: %s"
+          % ", ".join(who(r) for r in ok))
+    w("signal-agent:   send timestamp %s" % ts)
+    sys.exit(1)
+
+if not results:
+    # Do not repeat the old bug in a new costume: with no per-recipient result
+    # we cannot prove acceptance, so we must not report success.
+    w("signal-agent: SEND UNPROVEN — signal-cli returned no per-recipient "
+      "result (timestamp=%s, rc=%s). Not claiming delivery." % (ts, cli_rc))
+    sys.exit(1)
+
+if not isinstance(ts, int) or ts <= 0:
+    w("signal-agent: SEND UNPROVEN — recipients reported SUCCESS but the send "
+      "timestamp is unusable (%r). Not claiming delivery." % (ts,))
+    sys.exit(1)
+
+w("signal-agent: ACCEPTED by Signal server for %s (ts %s)"
+  % (", ".join(who(r) for r in results), ts))
+w("signal-agent: note — acceptance != delivery. The recipient's device may be "
+  "offline; correlate ts %s against receiptMessage entries in messages.jsonl." % ts)
+print(ts)
+PY
+}
+
+# Push the signal-channel dir to Google Drive. No-op (warn only) if the rclone
+# remote isn't configured yet, so `receive` never breaks pre-OAuth.
+do_backup() {
+  if ! command -v rclone >/dev/null 2>&1; then
+    echo "signal-agent: rclone not installed; skipping backup" >&2
+    return 0
+  fi
+  if ! rclone listremotes 2>/dev/null | grep -q "^${RCLONE_REMOTE}:$"; then
+    echo "signal-agent: rclone remote '${RCLONE_REMOTE}:' not configured yet; skipping backup (owner OAuth pending)" >&2
+    return 0
+  fi
+  rclone copy "$STORE" "${RCLONE_REMOTE}:${RCLONE_PATH}" --transfers 2 --checkers 4 2>&1 \
+    && echo "signal-agent: backed up ledger -> ${RCLONE_REMOTE}:${RCLONE_PATH}" >&2
+}
+
+cmd="${1:-}"; shift 2>/dev/null || true
+
+case "$cmd" in
+  whoami)
+    SIGNAL_CLI listDevices 2>/dev/null || SIGNAL_CLI -o json listAccounts
+    ;;
+
+  link)
+    # OWNER-GATE: links this box as a secondary device to the owner's Signal
+    # account. BLOCKS printing a sgnl:// URI / QR that the owner must scan from
+    # his phone (Signal > Settings > Linked Devices). JAVA_HOME is pinned above
+    # so this works regardless of the caller's environment. Ctrl-C to abort.
+    name="${1:-${SIGNAL_DEVICE_NAME:-$(hostname -s)}}"
+    SIGNAL_CLI link -n "$name"
+    ;;
+
+  receive)
+    # Pull everything queued since last run. signal-cli on a linked device
+    # fetches all messages held server-side since we were last online, so
+    # running this on-demand does NOT drop messages — only delays visibility.
+    before=0
+    [ -f "$LEDGER" ] && before="$(wc -c < "$LEDGER" | tr -d ' ')"
+    out="$(SIGNAL_CLI -o json receive --timeout 8 2>/dev/null || true)"
+    if [ -n "$out" ]; then
+      printf '%s\n' "$out" >> "$LEDGER"
+    fi
+    printf '%s\n' "$out"
+    # Event-driven backup: only push to Drive if the ledger actually grew.
+    after=0
+    [ -f "$LEDGER" ] && after="$(wc -c < "$LEDGER" | tr -d ' ')"
+    if [ "$after" -gt "$before" ]; then
+      do_backup
+    fi
+    ;;
+
+  backup)
+    do_backup
+    ;;
+
+  recent)
+    n="${1:-20}"
+    [ -f "$LEDGER" ] || { echo "no messages yet (run: signal-agent receive)"; exit 0; }
+    # Pretty one-line-per-message view: timestamp, sender, body.
+    tail -n 400 "$LEDGER" | python3 - "$n" <<'PY'
+import sys, json
+n = int(sys.argv[1])
+rows = []
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        obj = json.loads(line)
+    except Exception:
+        continue
+    env = obj.get("envelope", obj)
+    dm = env.get("dataMessage") or {}
+    body = dm.get("message")
+    if not body:
+        continue
+    src = env.get("sourceName") or env.get("sourceNumber") or env.get("source") or "?"
+    ts = env.get("timestamp", 0)
+    grp = (dm.get("groupInfo") or {}).get("groupId")
+    rows.append((ts, src, grp, body))
+rows.sort(key=lambda r: r[0])
+import datetime
+for ts, src, grp, body in rows[-n:]:
+    try:
+        t = datetime.datetime.fromtimestamp(ts/1000).strftime("%m-%d %H:%M")
+    except Exception:
+        t = str(ts)
+    tag = f"[grp]" if grp else ""
+    print(f"{t} {tag}{src}: {body}")
+PY
+    ;;
+
+  send-attach)
+    # send <recipient> <file> <message...> — same verified path as `send`,
+    # with one attachment. Added 2026-08-31: `send` could only do text.
+    rcpt="${1:-}"; shift 2>/dev/null || true
+    att="${1:-}"; shift 2>/dev/null || true
+    [ -n "$rcpt" ] || die "usage: signal-agent send-attach <uuid|+E164> <file> <message...>"
+    [ -f "$att" ] || die "attachment not found: $att"
+    msg="$*"
+    [ -n "$msg" ] || die "empty message"
+    # signal-cli's -a takes nargs=+, so it swallows a trailing recipient.
+    # Put -a first and terminate the option list with -- before the recipient.
+    if [ "${rcpt#--}" != "$rcpt" ]; then
+      # Flag-style recipient (e.g. --note-to-self): it is an option, not a
+      # positional, so no `--` terminator. Put -a last so its nargs=+ has
+      # nothing left to swallow.
+      do_send "$rcpt" -m "$msg" -a "$att"
+    else
+      do_send -a "$att" -m "$msg" -- "$rcpt"
+    fi
+    ;;
+
+  send)
+    rcpt="${1:-}"; shift 2>/dev/null || true
+    [ -n "$rcpt" ] || die "usage: signal-agent send <+E164|uuid|--note-to-self> <message...>"
+    msg="$*"
+    [ -n "$msg" ] || die "empty message"
+    # do_send verifies server acceptance and sets the exit code accordingly;
+    # on success it prints the bare send timestamp to stdout.
+    do_send -m "$msg" "$rcpt"
+    ;;
+
+  send-group)
+    gid="${1:-}"; shift 2>/dev/null || true
+    [ -n "$gid" ] || die "usage: signal-agent send-group <groupId> <message...>"
+    msg="$*"
+    SIGNAL_CLI send -m "$msg" -g "$gid"
+    ;;
+
+  groups)
+    SIGNAL_CLI -o json listGroups
+    ;;
+
+  contacts)
+    SIGNAL_CLI -o json listContacts
+    ;;
+
+  *)
+    grep '^#' "$0" | sed 's/^# \{0,1\}//'
+    exit 1
+    ;;
+esac

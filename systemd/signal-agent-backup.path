@@ -1,0 +1,9 @@
+[Unit]
+Description=Real-time: back up Signal ledger to Drive whenever it changes
+
+[Path]
+PathModified=%h/.signal-agent/messages.jsonl
+Unit=signal-agent-backup.service
+
+[Install]
+WantedBy=default.target

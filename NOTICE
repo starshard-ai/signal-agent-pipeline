@@ -1,0 +1,10 @@
+signal-agent-pipeline
+Copyright 2026 Macheng Shen
+
+This product wraps signal-cli (https://github.com/AsamK/signal-cli, GPL-3.0),
+which is invoked as a separate executable and is NOT bundled or modified here.
+Install signal-cli separately under its own license.
+
+The scripts were extracted from a private personal-agent deployment; all
+account identifiers, hosts, and credentials were replaced with environment
+variables before publication.
