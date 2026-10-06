@@ -1,7 +1,9 @@
 [Unit]
-Description=Real-time: back up Signal ledger to Drive whenever it changes
+Description=Real-time: back up the Signal ledger off-box whenever it changes
 
 [Path]
+# systemd cannot read SIGNAL_HOME here. This watches the DEFAULT ledger location;
+# if you changed SIGNAL_HOME, edit this line to match.
 PathModified=%h/.signal-agent/messages.jsonl
 Unit=signal-agent-backup.service
 

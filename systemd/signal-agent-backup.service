@@ -1,7 +1,8 @@
 [Unit]
-Description=Zhizi Signal agent - rclone copy message ledger to Google Drive
+Description=signal-agent - rclone copy the message ledger off-box (no-op until the rclone remote exists)
 
 [Service]
 Type=oneshot
 Environment=PATH=%h/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Settings come from ~/.config/signal-agent.env, which bin/signal-agent loads itself.
 ExecStart=%h/bin/signal-agent backup

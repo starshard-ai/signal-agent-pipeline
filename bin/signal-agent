@@ -15,7 +15,7 @@
 #                                   account (prints QR/URI to scan; blocks)
 #   signal-agent whoami           — show linked account / device state
 #   signal-agent receive          — pull queued messages, append to ledger, print JSON,
-#                                   and (if new bytes were appended) push ledger to Drive
+#                                   and (if new bytes were appended) push ledger off-box (rclone)
 #   signal-agent recent [N]       — show last N received messages (default 20) from ledger
 #   signal-agent send <recipient> <message...>   — send to a number (+E164),
 #                                   a UUID, or --note-to-self. VERIFIED: exits 0
@@ -24,18 +24,43 @@
 #                                   prints the send timestamp on stdout, logs
 #                                   the raw result to sent.jsonl, and prints the
 #                                   parsed reason + non-zero rc on rejection.
-#   signal-agent send-group <groupId> <message...>
+#   signal-agent send-group <groupId> <message...>  — same verified path as send
 #   signal-agent groups           — list groups
 #   signal-agent contacts         — list known contacts
-#   signal-agent backup           — rclone copy the signal-channel dir to Google Drive
+#   signal-agent backup           — rclone copy the ledger dir to $SIGNAL_RCLONE_REMOTE
+#
+# Config: ~/.config/signal-agent.env (or $SIGNAL_AGENT_ENV) is loaded by this
+# script itself, so systemd units, cron and `ssh box signal-agent ...` all see
+# the same settings as your interactive shell. Variables already set in the
+# environment win over the file.
 #
 # recipient = E.164 phone number (+8613..., +1...) or saved contact.
 set -euo pipefail
 
-# signal-cli 0.14.5 is compiled for Java 25 (class file 69). The box's system
-# java is 21, so pin signal-cli to the dedicated Temurin JDK 25 in /opt/jdk25.
-# This does NOT change the system java used by the rest of the fleet.
-export JAVA_HOME="${JAVA_HOME_SIGNAL_CLI:-${JAVA_HOME:-/opt/jdk25}}"
+# Load config from file (works for interactive, systemd, cron and ssh alike).
+SIGNAL_AGENT_ENV="${SIGNAL_AGENT_ENV:-$HOME/.config/signal-agent.env}"
+if [ -f "$SIGNAL_AGENT_ENV" ]; then
+  _keep=""
+  for _v in SIGNAL_CLI_BIN SIGNAL_CLI_PREFIX SIGNAL_HOME SIGNAL_DEVICE_NAME \
+            JAVA_HOME_SIGNAL_CLI SIGNAL_JNI_PATH SIGNAL_RCLONE_REMOTE SIGNAL_RCLONE_PATH; do
+    if [ -n "${!_v:-}" ]; then _keep="$_keep $_v=$(printf %q "${!_v}")"; fi
+  done
+  set -a; . "$SIGNAL_AGENT_ENV"; set +a
+  if [ -n "$_keep" ]; then eval "export $_keep"; fi
+  unset _keep _v
+fi
+
+# Java: signal-cli >= 0.14.5 is compiled for Java 25 (class file 69).
+#   - JAVA_HOME_SIGNAL_CLI set -> use exactly that JDK/JRE for signal-cli.
+#   - else, JAVA_HOME unset and /opt/jdk25 exists -> use /opt/jdk25.
+#   - else leave JAVA_HOME alone, so signal-cli finds `java` on PATH (e.g. an
+#     apt-installed openjdk-25). Never point JAVA_HOME at a directory that
+#     does not exist.
+if [ -n "${JAVA_HOME_SIGNAL_CLI:-}" ]; then
+  export JAVA_HOME="$JAVA_HOME_SIGNAL_CLI"
+elif [ -z "${JAVA_HOME:-}" ] && [ -x /opt/jdk25/bin/java ]; then
+  export JAVA_HOME=/opt/jdk25
+fi
 
 # ENCODING FIX (2026-07-11): non-interactive ssh sessions inherit macOS-forwarded
 # LC_CTYPE=UTF-8, which is INVALID on Linux -> locale falls back to POSIX ->
@@ -49,6 +74,9 @@ unset LC_CTYPE LANGUAGE
 export JAVA_TOOL_OPTIONS="-Dfile.encoding=UTF-8 -Dsun.jnu.encoding=UTF-8 ${SIGNAL_JNI_PATH:+-Djava.library.path=$SIGNAL_JNI_PATH }${JAVA_TOOL_OPTIONS:-}"
 
 SIGNAL_BIN="${SIGNAL_CLI_BIN:-$(command -v signal-cli || echo /opt/signal-cli/bin/signal-cli)}"
+# Optional command prefix, e.g. a proxy wrapper (INSTALL.md step 5):
+#   SIGNAL_CLI_PREFIX="proxychains4 -q -f $HOME/.config/signal-agent-proxychains.conf"
+read -r -a SIGNAL_PREFIX <<<"${SIGNAL_CLI_PREFIX:-}"
 
 STORE="${SIGNAL_HOME:-$HOME/.signal-agent}"
 LEDGER="$STORE/messages.jsonl"
@@ -59,17 +87,22 @@ LEDGER="$STORE/messages.jsonl"
 SENTLOG="$STORE/sent.jsonl"
 mkdir -p "$STORE"
 
-# Google Drive backup target (rclone). Remote name + folder are owner-gated
+# Off-box backup target (rclone, e.g. a Google Drive remote). Remote name + folder are owner-gated
 # (rclone OAuth). backup() no-ops gracefully until the remote exists.
 RCLONE_REMOTE="${SIGNAL_RCLONE_REMOTE:-gdrive}"
 RCLONE_PATH="${SIGNAL_RCLONE_PATH:-signal-agent-backup}"
 
 die() { echo "signal-agent: $*" >&2; exit 1; }
-[ -x "$SIGNAL_BIN" ] || die "signal-cli not found ($SIGNAL_BIN)"
+if [ ! -x "$SIGNAL_BIN" ]; then
+  case "$SIGNAL_BIN" in
+    *" "*) die "SIGNAL_CLI_BIN must be the path to signal-cli only ($SIGNAL_BIN). Put a proxy wrapper in SIGNAL_CLI_PREFIX instead (INSTALL.md step 5)." ;;
+  esac
+  die "signal-cli not found ($SIGNAL_BIN)"
+fi
 
-# Clean network on this box — call signal-cli directly, no proxychains.
+# Direct call by default; SIGNAL_CLI_PREFIX (if set) is prepended, e.g. proxychains.
 SIGNAL_CLI() {
-  "$SIGNAL_BIN" "$@"
+  ${SIGNAL_PREFIX[@]+"${SIGNAL_PREFIX[@]}"} "$SIGNAL_BIN" "$@"
 }
 
 # ---------------------------------------------------------------------------
@@ -188,7 +221,7 @@ print(ts)
 PY
 }
 
-# Push the signal-channel dir to Google Drive. No-op (warn only) if the rclone
+# Push the ledger dir off-box via rclone. No-op (warn only) if the rclone
 # remote isn't configured yet, so `receive` never breaks pre-OAuth.
 do_backup() {
   if ! command -v rclone >/dev/null 2>&1; then
@@ -207,7 +240,13 @@ cmd="${1:-}"; shift 2>/dev/null || true
 
 case "$cmd" in
   whoami)
-    SIGNAL_CLI listDevices 2>/dev/null || SIGNAL_CLI -o json listAccounts
+    # signal-cli 0.14.8 can hang in listDevices (upstream issue #2119), so bound
+    # it when `timeout` is available and fall back to listAccounts.
+    if command -v timeout >/dev/null 2>&1; then
+      timeout 60 ${SIGNAL_PREFIX[@]+"${SIGNAL_PREFIX[@]}"} "$SIGNAL_BIN" listDevices 2>/dev/null || SIGNAL_CLI -o json listAccounts
+    else
+      SIGNAL_CLI listDevices 2>/dev/null || SIGNAL_CLI -o json listAccounts
+    fi
     ;;
 
   link)
@@ -230,11 +269,18 @@ case "$cmd" in
       printf '%s\n' "$out" >> "$LEDGER"
     fi
     printf '%s\n' "$out"
-    # Event-driven backup: only push to Drive if the ledger actually grew.
+    # Event-driven backup: only push off-box if the ledger actually grew, and
+    # only when the systemd .path unit is not active (it backs up on the same
+    # change, so doing it here too would run every backup twice).
     after=0
     [ -f "$LEDGER" ] && after="$(wc -c < "$LEDGER" | tr -d ' ')"
     if [ "$after" -gt "$before" ]; then
-      do_backup
+      if command -v systemctl >/dev/null 2>&1 \
+         && systemctl --user is-active --quiet signal-agent-backup.path 2>/dev/null; then
+        :
+      else
+        do_backup
+      fi
     fi
     ;;
 
@@ -314,7 +360,9 @@ PY
     gid="${1:-}"; shift 2>/dev/null || true
     [ -n "$gid" ] || die "usage: signal-agent send-group <groupId> <message...>"
     msg="$*"
-    SIGNAL_CLI send -m "$msg" -g "$gid"
+    [ -n "$msg" ] || die "empty message"
+    # Same verified path as `send`: exit 0 only on server SUCCESS.
+    do_send -m "$msg" -g "$gid"
     ;;
 
   groups)

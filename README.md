@@ -14,18 +14,18 @@ is the protocol layer; this repo is one **channel adapter**).
 
 | path | role |
 |---|---|
-| `bin/signal-agent` | wrapper over `signal-cli`: `link`, `whoami`, `receive`, `recent`, `send`, `send-attach`, `send-group`, `groups`, `contacts`, `backup` |
+| `bin/signal-agent` | wrapper over `signal-cli`: `link`, `whoami`, `receive`, `recent`, `send`, `send-attach`, `send-group`, `groups`, `contacts`, `backup`; loads `~/.config/signal-agent.env` itself |
 | `bin/fleet-drop` | from any machine: `scp` a file to the linked box, then `signal-agent send-attach --note-to-self` → lands in Signal *Note to Self* on your phone |
 | `systemd/` | user units: hourly `receive` timer (fail-safe cadence) + a `.path` unit that backs up the ledger the moment it changes (event-driven primary) |
 | `examples/proxychains.conf.example` | only needed when your network blocks Signal's endpoints |
-| `.env.example` | every knob; nothing secret lives in the repo |
+| `.env.example` | every knob (copy to `~/.config/signal-agent.env`); nothing secret lives in the repo |
 
 ## Design decisions (why it looks like this)
 
 - **Linked device, not a bot.** The agent reads and writes *your* conversations
   with the people you choose; there is no second identity to manage, and
   end-to-end encryption is untouched.
-- **Proof of send = server result, not exit code.** `send` parses `signal-cli -o json`
+- **Proof of send = server result, not exit code.** `send`, `send-attach` and `send-group` parse `signal-cli -o json`
   `results[].type` and only prints a timestamp when the server said `SUCCESS`.
   `ACCEPTED` by the server is still not proof of delivery or reading; treat it that way.
 - **Flat-file ledgers.** `messages.jsonl` (received) and `sent.jsonl` (sent) under
@@ -38,8 +38,9 @@ is the protocol layer; this repo is one **channel adapter**).
 
 ## Quick start
 
-See [INSTALL.md](INSTALL.md). The only owner-gated step is scanning the link QR
-from Signal on your phone; everything else is scriptable.
+See [INSTALL.md](INSTALL.md). Requirements in short: **Java 25** and
+**signal-cli 0.14.7** (skip 0.14.8, see INSTALL.md). The only owner-gated step is
+scanning the link QR from Signal on your phone; everything else is scriptable.
 
 ```bash
 signal-agent link my-agent-box     # prints a sgnl:// URI + QR — scan it from Signal > Linked Devices
