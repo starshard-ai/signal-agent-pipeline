@@ -292,11 +292,15 @@ case "$cmd" in
     n="${1:-20}"
     [ -f "$LEDGER" ] || { echo "no messages yet (run: signal-agent receive)"; exit 0; }
     # Pretty one-line-per-message view: timestamp, sender, body.
-    tail -n 400 "$LEDGER" | python3 - "$n" <<'PY'
+    # The script comes in on stdin via the heredoc, so the ledger is passed as
+    # a path (piping it in as well would make the heredoc win and show nothing).
+    python3 - "$n" "$LEDGER" <<'PY'
 import sys, json
 n = int(sys.argv[1])
+with open(sys.argv[2], encoding="utf-8", errors="replace") as fh:
+    tail_lines = fh.read().splitlines()[-400:]
 rows = []
-for line in sys.stdin:
+for line in tail_lines:
     line = line.strip()
     if not line:
         continue
